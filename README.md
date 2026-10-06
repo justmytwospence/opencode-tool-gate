@@ -56,10 +56,11 @@ decision is logged under the `tool-gate` service with Jev's scores and latency
 
 ## Project rules
 
-Each top-level bullet in `<project>/.opencode/tool-gate-rules.md` and
-`~/.config/opencode/tool-gate-rules.md` is a rule (at most 30), checked on every judged call. A
-project or home with only pi's files (`.pi/tool-gate-rules.md`, `~/.pi/agent/tool-gate-rules.md`)
-is read as a fallback.
+Each top-level bullet in a rules file is a rule, checked on every judged call. The rules are the
+union of `<project>/.agents/tool-gate-rules.md`, `<project>/.opencode/tool-gate-rules.md`,
+`~/.config/agents/tool-gate-rules.md` and `~/.config/opencode/tool-gate-rules.md`, in that order
+(`$XDG_CONFIG_HOME` honoured), exact duplicates dropped, at most 30. The `.agents` and
+`~/.config/agents` files are shared: the pi and Claude Code ports of tool-gate read the same ones.
 
 ```markdown
 - Migrations are append-only: never edit an existing migration, add a new one.
@@ -72,30 +73,50 @@ In `opencode.jsonc`, pinned to a commit:
 
 ```jsonc
 "plugin": [
-  ["opencode-tool-gate@github:justmytwospence/opencode-tool-gate#<commit>", {
-    // all optional; defaults shown
-    "enabled": true,
-    "jev": { "model": "jev-latest", "timeoutMs": 3000 },
-    "thresholds": {
-      "irreversible": 0.9, "remoteChange": 0.85, "requested": 0.8, "exfiltration": 0.8,
-      "impact": 2.5, "offTask": 0.1, "offTaskImpact": 1.5, "rule": 0.7
-    },
-    "allowTools": ["task", "todowrite", "todoread", "question", "skill", "websearch", "webfetch", "codesearch"],
-    "readOnlyCommands": [],
-    "pushBack": true
-  }]
+  "opencode-tool-gate@github:justmytwospence/opencode-tool-gate#<commit>"
 ]
+```
+
+Needs `TYPESAFE_API_KEY` in opencode's environment. Tested with opencode 1.18.29.
+
+## Settings
+
+Settings live in a shared, harness-neutral place that the pi and Claude Code ports of this plugin
+read as well, so one file configures tool-gate everywhere: `~/.config/agents/tool-gate.json` (under
+`$XDG_CONFIG_HOME` when set) for you, and `<project>/.agents/tool-gate.json` for a project. Keys a
+harness does not know are ignored, so pi-only keys in the same file are fine. All keys are
+optional; the defaults:
+
+```jsonc
+{
+  "enabled": true,
+  "jev": { "model": "jev-latest", "timeoutMs": 3000 },
+  "thresholds": {
+    "irreversible": 0.9, "remoteChange": 0.85, "requested": 0.8, "exfiltration": 0.8,
+    "impact": 2.5, "offTask": 0.1, "offTaskImpact": 1.5, "rule": 0.7
+  },
+  "allowTools": ["task", "todowrite", "todoread", "question", "skill", "websearch", "webfetch", "codesearch"],
+  "readOnlyCommands": [],
+  "pushBack": true
+}
 ```
 
 `allowTools` replaces the default list. `task` is allowed because each tool a subagent calls is
 gated on its own; `webfetch` only does GETs. `readOnlyCommands` adds programs (say `bd`) treated
-as read-only in bash. Needs `TYPESAFE_API_KEY` in opencode's environment. Tested with opencode
-1.18.29.
+as read-only in bash.
+
+opencode-only overrides go in the plugin's options in `opencode.jsonc` (the second element of the
+plugin tuple, `["opencode-tool-gate@...", { "pushBack": false }]`) or in
+`<project>/.opencode/tool-gate.json`. The layers merge in this order, later winning, objects
+deep-merged and arrays and scalars replaced: built-in defaults, `~/.config/agents/tool-gate.json`,
+the `opencode.jsonc` options, `<project>/.agents/tool-gate.json`, `<project>/.opencode/tool-gate.json`.
+The files are re-read when they change, so edits apply to the next tool call without a restart; a
+missing or invalid file is ignored.
 
 ## Differences from pi-tool-gate
 
 - No `/gate` command, status line or toasts: a server plugin cannot register commands or draw UI.
-  Turn the gate off with `"enabled": false` in the plugin options.
+  Turn the gate off with `"enabled": false` in a settings file; it applies to the next call.
 - No "allow similar for this session": approval is per exact call, through the `question` tool.
 - Without Jev, pi asked you about calls its tool hints flagged; opencode plugins cannot see tool
   annotations, so judged calls fall through to opencode's own permission rules instead.

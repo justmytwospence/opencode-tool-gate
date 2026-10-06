@@ -4,8 +4,10 @@
 // only channel a server plugin has: the thrown error is what the agent reads. The agent works
 // around it, or asks you with opencode's `question` tool, quoting the call, with "Allow" and "Deny"
 // options; an "Allow" answer lets the identical retry through, once. Project rules in
-// `.opencode/tool-gate-rules.md` are checked on every judged call. Without Jev, calls fall through
-// to opencode's own permission rules.
+// `.agents/tool-gate-rules.md` and `.opencode/tool-gate-rules.md` are checked on every judged
+// call. Without Jev, calls fall through to opencode's own permission rules. Settings come from the
+// shared `~/.config/agents/tool-gate.json` and `.agents/tool-gate.json`, the plugin options, and
+// `.opencode/tool-gate.json`, read on each call (see settings.ts).
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -24,7 +26,11 @@ import {
   workaroundQuestion,
 } from "./judge.ts";
 import { loadRules } from "./rules.ts";
+import { deepMerge, loadSettings } from "./settings.ts";
 import { type MessageLike, clip, clipTail, recentTexts, recentUserMessages } from "./transcript.ts";
+
+/** The plugin's name: its settings files are `<dir>/tool-gate.json`. */
+export const NAME = "tool-gate";
 
 export interface Options {
   enabled: boolean;
@@ -93,14 +99,17 @@ interface GitInfo {
   dirty: boolean;
 }
 
+/** The plugin options from opencode.jsonc over the defaults: that layer alone, without the shared files. */
 export function resolveOptions(raw: Record<string, unknown> | undefined): Options {
-  const o = (raw ?? {}) as Partial<Options>;
-  return {
-    ...DEFAULT_OPTIONS,
-    ...o,
-    jev: { ...DEFAULT_OPTIONS.jev, ...(o.jev ?? {}) },
-    thresholds: { ...DEFAULT_OPTIONS.thresholds, ...(o.thresholds ?? {}) },
-  };
+  return deepMerge(DEFAULT_OPTIONS, raw);
+}
+
+/**
+ * The options in force now: defaults, `~/.config/agents/tool-gate.json`, the plugin options,
+ * `<directory>/.agents/tool-gate.json`, then `<directory>/.opencode/tool-gate.json`.
+ */
+export function currentOptions(raw: Record<string, unknown> | undefined, directory: string): Options {
+  return loadSettings(NAME, DEFAULT_OPTIONS, raw, directory);
 }
 
 const str = (value: unknown) => (typeof value === "string" ? value : "");
@@ -181,12 +190,17 @@ async function gitInfo(cwd: string): Promise<GitInfo | undefined> {
   }
 }
 
+/**
+ * `options` is read on every tool call when it is a function (the server passes one that merges
+ * the settings files), so edits apply without a restart.
+ */
 export async function createHooks(
   client: Client,
-  options: Options,
+  options: Options | (() => Options),
   directory: string,
   deps: { fetch?: typeof fetch; git?: (cwd: string) => Promise<GitInfo | undefined> } = {},
 ): Promise<Hooks> {
+  const optionsNow = typeof options === "function" ? options : () => options;
   const sessions = new Map<string, SessionState>();
   const session = (id: string): SessionState => {
     let s = sessions.get(id);
@@ -196,7 +210,7 @@ export async function createHooks(
     }
     return s;
   };
-  const jevOptions = { model: options.jev.model, timeoutMs: options.jev.timeoutMs, ...(deps.fetch ? { fetch: deps.fetch } : {}) };
+  const jevOptionsFor = (options: Options) => ({ model: options.jev.model, timeoutMs: options.jev.timeoutMs, ...(deps.fetch ? { fetch: deps.fetch } : {}) });
 
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
     client.app.log({ body: { service: "tool-gate", level, message, ...(extra ? { extra } : {}) } }).catch(() => undefined);
@@ -210,7 +224,7 @@ export async function createHooks(
     return info;
   };
 
-  const plan = async (s: SessionState, tool: string, args: Args, cwd: string): Promise<Plan> => {
+  const plan = async (options: Options, s: SessionState, tool: string, args: Args, cwd: string): Promise<Plan> => {
     if (options.allowTools.includes(tool)) return { kind: "allow", why: "allow list" };
     if (tool === "bash") {
       const command = str(args.command);
@@ -271,6 +285,7 @@ export async function createHooks(
    * is blocked again, with the same instructions.
    */
   const hold = async (
+    options: Options,
     s: SessionState,
     h: Held & { reason: string; state: Record<string, unknown> },
   ): Promise<never> => {
@@ -285,7 +300,7 @@ export async function createHooks(
     s.pushedBack.add(held.exact);
     s.pushedBack.add(held.family);
     if (options.pushBack && !repeat) {
-      const suggestion = await askJev({ ...state, held_because: reason }, workaroundQuestion(), jevOptions);
+      const suggestion = await askJev({ ...state, held_because: reason }, workaroundQuestion(), jevOptionsFor(options));
       const ideas = suggestion.ok ? suggestions(suggestion.answers) : [];
       const noWorkaround = ideas[0] === WORKAROUNDS.user_only;
       const advice = noWorkaround
@@ -311,12 +326,13 @@ export async function createHooks(
 
   return {
     "tool.execute.before": async (input, output) => {
+      const options = optionsNow();
       if (!options.enabled) return;
       const tool = input.tool;
       const args = ((output.args ?? {}) as Args);
       const s = session(input.sessionID);
       const cwd = (tool === "bash" && str(args.workdir)) || directory;
-      const p = await plan(s, tool, args, cwd);
+      const p = await plan(options, s, tool, args, cwd);
       const call = describeCall(tool, args);
 
       if (p.kind === "allow") {
@@ -338,7 +354,7 @@ export async function createHooks(
 
       if (p.kind === "ask") {
         const why = p.reasons.join("; ");
-        return hold(s, {
+        return hold(options, s, {
           tool,
           exact,
           family: p.key,
@@ -351,7 +367,7 @@ export async function createHooks(
 
       const rules = loadRules(directory);
       const state = await judgeStateFor(input.sessionID, s, cwd, tool, args, p.args, rules);
-      const outcome = await askJev(state, judgeQuestions(rules), jevOptions);
+      const outcome = await askJev(state, judgeQuestions(rules), jevOptionsFor(options));
 
       if (!outcome.ok) {
         await log("warn", `allow: ${call}`, { why: `Jev unavailable (${outcome.reason}); opencode's own permission rules apply` });
@@ -368,7 +384,7 @@ export async function createHooks(
       });
       if (action === "allow") return;
       const brokenRules = v!.brokenRules.length ? ` (${v!.brokenRules.map((r) => `"${clip(r, 120)}"`).join(", ")})` : "";
-      return hold(s, {
+      return hold(options, s, {
         tool,
         exact,
         family: p.key,
@@ -420,6 +436,7 @@ export async function createHooks(
   };
 }
 
-const server: Plugin = async (input, options) => createHooks(input.client, resolveOptions(options), input.directory);
+const server: Plugin = async (input, options) =>
+  createHooks(input.client, () => currentOptions(options, input.directory), input.directory);
 
-export default { id: "tool-gate", server };
+export default { id: NAME, server };

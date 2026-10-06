@@ -1,9 +1,13 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
-import { DECLINED, DEFAULT_OPTIONS, type Options, createHooks, exactKey, questionAnswers, resolveOptions, targetOf } from "../src/index.ts";
+import { DECLINED, DEFAULT_OPTIONS, NAME, type Options, createHooks, currentOptions, exactKey, questionAnswers, resolveOptions, targetOf } from "../src/index.ts";
 import { loadRules } from "../src/rules.ts";
+
+// Keep the user's own rules and settings files out of the tests.
+const root = mkdtempSync(path.join(tmpdir(), "gate-"));
+process.env.XDG_CONFIG_HOME = path.join(root, "config");
 
 const safe = {
   in_scope: { type: "noul", noul: 0.95 },
@@ -35,7 +39,7 @@ interface Setup {
   key?: string;
   /** Every Jev request fails. */
   down?: boolean;
-  options?: Partial<Options>;
+  options?: Partial<Options> | (() => Options);
   directory?: string;
   messages?: Message[];
 }
@@ -62,7 +66,8 @@ async function setup(s: Setup = {}) {
     app: { log: async ({ body }: { body: (typeof logs)[number] }) => (logs.push(body), {}) },
   };
   const directory = s.directory ?? "/Users/me/Projects/app";
-  const hooks = await createHooks(client as never, resolveOptions(s.options), directory, {
+  const options = typeof s.options === "function" ? s.options : resolveOptions(s.options);
+  const hooks = await createHooks(client as never, options, directory, {
     fetch: fetchImpl,
     git: async () => ({ branch: "feature", dirty: false }),
   });
@@ -172,14 +177,14 @@ test("when Jev sees no workaround, the agent is told it is the user's decision",
   expect(first).not.toMatch(/why the workarounds fall short/u);
 });
 
-test("project rules are judged and quoted back; opencode's rules file wins over pi's", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "gate-"));
-  mkdirSync(path.join(dir, ".pi"));
-  writeFileSync(path.join(dir, ".pi", "tool-gate-rules.md"), "- Never edit files under build/.\n");
-  expect(loadRules(dir)).toEqual(["Never edit files under build/."]);
-  mkdirSync(path.join(dir, ".opencode"));
-  writeFileSync(path.join(dir, ".opencode", "tool-gate-rules.md"), "- Never edit files under dist/.\n");
+test("project rules are judged and quoted back; the shared and opencode rules files are both read", async () => {
+  const dir = path.join(root, "project");
+  mkdirSync(path.join(dir, ".agents"), { recursive: true });
+  writeFileSync(path.join(dir, ".agents", "tool-gate-rules.md"), "- Never edit files under dist/.\n");
   expect(loadRules(dir)).toEqual(["Never edit files under dist/."]);
+  mkdirSync(path.join(dir, ".opencode"));
+  writeFileSync(path.join(dir, ".opencode", "tool-gate-rules.md"), "- Never edit files under dist/.\n- Never edit files under build/.\n");
+  expect(loadRules(dir)).toEqual(["Never edit files under dist/.", "Never edit files under build/."]);
 
   const s = await setup({ answers: { ...safe, "rule::0": { type: "noul", noul: 0.95 } }, directory: dir });
   const result = await s.call("edit", { filePath: "dist/index.js", oldString: "a", newString: "b" });
@@ -241,6 +246,26 @@ test("options merge over the defaults", () => {
   expect(o.thresholds).toEqual({ ...DEFAULT_OPTIONS.thresholds, impact: 2 });
   expect(o.jev).toEqual({ model: "jev-latest", timeoutMs: 500 });
   expect(o.pushBack).toBe(true);
+});
+
+test("the shared settings files are read on each call, so edits apply without a restart", async () => {
+  const directory = path.join(root, "live");
+  const file = path.join(root, "config", "agents", `${NAME}.json`);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify({ enabled: false }));
+  utimesSync(file, 1_000, 1_000);
+  const s = await setup({ answers: risky, directory, options: () => currentOptions({ pushBack: false }, directory) });
+  expect(await s.call("bash", { command: "npm publish" })).toBeUndefined();
+  expect(s.sent).toHaveLength(0);
+
+  writeFileSync(file, JSON.stringify({ enabled: true, readOnlyCommands: ["bd"] }));
+  utimesSync(file, 2_000, 2_000);
+  expect(await s.call("bash", { command: "bd list" })).toBeUndefined();
+  expect(s.logs.at(-1)?.extra?.why).toBe("read-only command");
+  const held = await s.call("bash", { command: "npm publish" });
+  expect(held).toMatch(/The user has not been asked. To run it, ask the user/u);
+  expect(held).not.toMatch(/Jev suggests/u);
+  expect(s.sent).toHaveLength(1);
 });
 
 test("the exact call ignores a bash description, and the target is what the question must quote", () => {
