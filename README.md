@@ -108,4 +108,12 @@ npm install
 npm run check   # typecheck and tests
 ```
 
-Try a local checkout with `"file:///path/to/opencode-tool-gate"` in the plugin list.
+Try a local checkout in place of the pin: opencode dedupes plugins by package name and the later
+config wins, so
+
+```sh
+printf '{"plugin":["opencode-tool-gate@file:'"$PWD"'"]}' > /tmp/try.json
+OPENCODE_CONFIG=/tmp/try.json opencode
+```
+
+links this checkout instead of the pinned commit.
