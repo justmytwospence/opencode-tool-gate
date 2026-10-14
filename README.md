@@ -1,3 +1,5 @@
+> **Retired.** This plugin now lives in [opencode-plugins](https://github.com/justmytwospence/opencode-plugins/tree/main/packages/opencode-tool-gate), ported to OpenCode 2. This repository is archived for history; do not install it alongside the suite.
+
 # opencode-tool-gate
 
 An [opencode](https://opencode.ai) plugin that auto-approves tool calls, so you are only pulled in
